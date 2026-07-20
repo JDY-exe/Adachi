@@ -78,12 +78,53 @@ You need a computer with `adb` (Android platform-tools) and a USB cable.
 
 Requirements: JDK 17 and the Android SDK (platform `android-34`).
 
+#### Setting up the toolchain (Arch Linux)
+
+```bash
+# JDK 17 + udev rules so your user can talk to the Pixel over USB
+sudo pacman -Syu --needed jdk17-openjdk android-udev
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Android SDK (user-owned, standard location)
+mkdir -p ~/Android/Sdk/cmdline-tools
+cd ~/Android/Sdk/cmdline-tools
+curl -O https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+unzip commandlinetools-linux-11076708_latest.zip
+mv cmdline-tools latest
+rm commandlinetools-linux-11076708_latest.zip
+
+# Environment variables
+cat >> ~/.bashrc <<'EOF'
+
+# Android SDK
+export ANDROID_HOME="$HOME/Android/Sdk"
+export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools"
+EOF
+source ~/.bashrc
+
+# SDK packages + licenses
+yes | sdkmanager --licenses
+sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+# Verify
+java -version        # openjdk 17.x
+sdkmanager --version
+adb --version
+```
+
+On Debian/Ubuntu the equivalent packages are `openjdk-17-jdk` and
+`android-sdk-platform-tools-common` (udev rules), with the same SDK steps.
+
+#### Build and install
+
 ```bash
 git clone <this repo>
 cd adachi
 ./gradlew :app:assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+
+Run the unit tests with `./gradlew :app:testDebugUnitTest`.
 
 ### Option B: install a prebuilt APK
 
