@@ -3,6 +3,8 @@ package com.adachi.lockdown.vpn
 import android.app.Notification
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -10,11 +12,11 @@ import androidx.core.app.NotificationCompat
 import com.adachi.lockdown.AdachiApp
 import com.adachi.lockdown.R
 import com.adachi.lockdown.data.BlockLog
-import com.adachi.lockdown.data.DomainRule
-import com.adachi.lockdown.data.RuleType
+import com.adachi.lockdown.data.EventLogger
+import com.adachi.lockdown.data.RuleWithTargets
+import com.adachi.lockdown.data.RuleCheckIn
 import com.adachi.lockdown.data.RulesRepository
 import com.adachi.lockdown.data.UnlockState
-import com.adachi.lockdown.data.UsageLedger
 import com.adachi.lockdown.rules.RuleEngine
 import com.adachi.lockdown.status.SystemStatus
 import com.adachi.lockdown.unlock.UnlockManager
@@ -27,9 +29,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.time.LocalDate
 import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
 
@@ -52,24 +52,24 @@ class AdachiVpnService : VpnService() {
     @Volatile private var running = false
     @Volatile private var paused = false
     private var tun: ParcelFileDescriptor? = null
-    private var forwarder: DnsForwarder? = null
+    @Volatile private var forwarder: DnsForwarder? = null
     private var output: FileOutputStream? = null
 
-    @Volatile private var rules: List<DomainRule> = emptyList()
+    @Volatile private var lastRebuildAt = 0L
+    @Volatile private var currentNetwork: Network? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
-    /** ruleId -> set of active minute-buckets today (domain quota accounting). */
-    private val quotaMinutes = ConcurrentHashMap<Long, MutableSet<String>>()
+    @Volatile private var rules: List<RuleWithTargets> = emptyList()
+    @Volatile private var checkIns: Map<Long, RuleCheckIn> = emptyMap()
 
     /** target -> last log epoch ms, to throttle block logging. */
     private val recentLogs = ConcurrentHashMap<String, Long>()
 
-    private val minuteFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm")
 
     override fun onCreate() {
         super.onCreate()
         repo = RulesRepository.get(this)
         observeState()
-        startUsageFlusher()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -77,6 +77,7 @@ class AdachiVpnService : VpnService() {
         if (!running) {
             if (crashLooping()) {
                 Log.e(TAG, "Crash loop detected — failing open (not establishing VPN)")
+                EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.ERROR, "crash loop detected — failing open, VPN not established")
                 notifyFailsafe()
                 SystemStatus.setVpnRunning(this, false)
                 stopSelf()
@@ -99,21 +100,103 @@ class AdachiVpnService : VpnService() {
                 .establish()
             if (tunFd == null) {
                 Log.e(TAG, "establish() returned null (VPN permission revoked?)")
+                EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.ERROR, "establish() returned null — VPN permission revoked?")
                 stopSelf()
                 return
             }
             tun = tunFd
-            forwarder = DnsForwarder(protect = { protect(it) }, scope = scope)
             output = FileOutputStream(tunFd.fileDescriptor)
             running = true
             SystemStatus.setVpnRunning(this, true)
             startReader(tunFd)
+            watchNetworks()
             Log.i(TAG, "VPN established")
+            EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.INFO, "VPN established (DNS-only, upstream 1.1.1.1, ${rules.size} enabled domain rules)")
+            // Socket creation must not run on the main thread: debug builds
+            // enforce StrictMode death-on-network (NetworkOnMainThreadException).
+            scope.launch { initForwarder() }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to establish VPN", e)
+            EventLogger.log(
+                EventLogger.Kind.VPN, EventLogger.Level.ERROR,
+                "failed to establish VPN (${e.javaClass.simpleName}): ${e.message}",
+            )
             recordCrash()
             stopSelf()
         }
+    }
+
+    private fun buildForwarder(): DnsForwarder =
+        DnsForwarder(
+            protect = { protect(it) },
+            scope = scope,
+            onDead = { rebuildForwarder("upstream unresponsive") },
+        ) { level, msg ->
+            EventLogger.log(EventLogger.Kind.UPSTREAM, EventLogger.Level.valueOf(level), msg)
+        }
+
+    /** Create the upstream socket off the main thread. Called from Dispatchers.IO. */
+    private fun initForwarder() {
+        try {
+            forwarder = buildForwarder()
+            // A healthy establish proves the crash loop is over; reset the counter.
+            clearCrashes()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create upstream socket", e)
+            EventLogger.log(
+                EventLogger.Kind.VPN, EventLogger.Level.ERROR,
+                "failed to create upstream DNS socket (${e.javaClass.simpleName}): ${e.message}",
+            )
+            recordCrash()
+            stopSelf()
+        }
+    }
+
+    /**
+     * The protected upstream socket is bound to the network it was created on
+     * and dies silently when the device switches networks — every query then
+     * times out, which looks exactly like "everything is blocked". Rebuild it
+     * on network changes and when the forwarder reports itself dead. Throttled
+     * so flapping networks can't churn sockets.
+     */
+    private fun rebuildForwarder(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastRebuildAt < 30_000) return
+        lastRebuildAt = now
+        EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.INFO, "rebuilding upstream DNS socket ($reason)")
+        // Swap only when the new socket is ready, so DNS is never dropped mid-flight.
+        scope.launch {
+            runCatching {
+                val new = buildForwarder()
+                val old = forwarder
+                forwarder = new
+                runCatching { old?.close() }
+            }.onFailure { e ->
+                EventLogger.log(
+                    EventLogger.Kind.VPN, EventLogger.Level.ERROR,
+                    "failed to rebuild upstream DNS socket (${e.javaClass.simpleName}): ${e.message}",
+                )
+            }
+        }
+    }
+
+    private fun watchNetworks() {
+        if (networkCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val previous = currentNetwork
+                currentNetwork = network
+                if (previous != null && previous != network) rebuildForwarder("network switch")
+            }
+
+            // Deliberately no onLost handling: on a handoff, onLost(old) often
+            // arrives AFTER onAvailable(new). Clearing currentNetwork there
+            // would mask the switch and skip the socket rebuild. The forwarder's
+            // send-error/timeout detection covers any remaining gaps.
+        }
+        networkCallback = cb
+        runCatching { cm.registerDefaultNetworkCallback(cb) }
     }
 
     private fun startReader(tunFd: ParcelFileDescriptor) {
@@ -129,6 +212,10 @@ class AdachiVpnService : VpnService() {
             } catch (e: Exception) {
                 if (running) {
                     Log.e(TAG, "Tunnel reader died", e)
+                    EventLogger.log(
+                        EventLogger.Kind.VPN, EventLogger.Level.ERROR,
+                        "tunnel reader died (${e.javaClass.simpleName}): ${e.message}",
+                    )
                     recordCrash()
                 }
             } finally {
@@ -146,16 +233,26 @@ class AdachiVpnService : VpnService() {
         val verdict = if (paused) {
             RuleEngine.Verdict.Allow
         } else {
-            RuleEngine.evaluateDomain(query.name, rules, now, quotaUsedToday())
+            RuleEngine.evaluateDomain(query.name, rules, checkIns, now, System.currentTimeMillis())
         }
 
         when (verdict) {
             is RuleEngine.Verdict.Block -> {
+                EventLogger.log(
+                    EventLogger.Kind.DNS, EventLogger.Level.BLOCK,
+                    "${query.name} → NXDOMAIN (${verdict.reason}, rule #${verdict.ruleId})",
+                    throttleKey = "blk:${query.name}", throttleMs = 5_000,
+                )
                 logBlock(query.name, verdict.reason.name)
                 respond(dgram, DnsCodec.buildNxdomain(query))
             }
             RuleEngine.Verdict.Allow -> {
-                recordQuotaActivity(query.name)
+                EventLogger.log(
+                    EventLogger.Kind.DNS, EventLogger.Level.ALLOW,
+                    if (paused) "${query.name} → allowed (enforcement paused)"
+                    else "${query.name} → allowed",
+                    throttleKey = "ok:${query.name}:${paused}", throttleMs = 60_000,
+                )
                 forward(dgram, query)
             }
         }
@@ -198,12 +295,21 @@ class AdachiVpnService : VpnService() {
     private fun observeState() {
         scope.launch {
             combine(
-                repo.domainRules(),
+                repo.rules(),
+                repo.checkIns(),
                 repo.unlockState(),
-            ) { rules, unlock -> rules to unlock }
-                .collect { (rules, unlock) ->
-                    this@AdachiVpnService.rules = rules.filter { it.enabled }
-                    paused = UnlockManager.isActive(unlock, System.currentTimeMillis())
+            ) { rules, checkIns, unlock -> Triple(rules, checkIns, unlock) }
+                .collect { (rules, grants, unlock) ->
+                    val enabled = rules.filter { it.rule.enabled }
+                    if (enabled != this@AdachiVpnService.rules) {
+                        EventLogger.log(
+                            EventLogger.Kind.VPN, EventLogger.Level.INFO,
+                            "domain rules reloaded: ${enabled.size} enabled",
+                        )
+                    }
+                    this@AdachiVpnService.rules = enabled
+                    this@AdachiVpnService.checkIns = grants.associateBy { it.ruleId }
+                    setPaused(UnlockManager.isActive(unlock, System.currentTimeMillis()))
                 }
         }
         // The unlock window expires by time alone; check periodically.
@@ -211,54 +317,21 @@ class AdachiVpnService : VpnService() {
             while (true) {
                 delay(15_000)
                 val s = repo.unlockStateNow()
-                val wasPaused = paused
-                paused = UnlockManager.isActive(s, System.currentTimeMillis())
-                if (wasPaused != paused) refreshNotification()
+                setPaused(UnlockManager.isActive(s, System.currentTimeMillis()))
             }
         }
     }
 
-    private fun quotaUsedToday(): Map<Long, Int> {
-        val todayPrefix = LocalDate.now().toString()
-        return quotaMinutes.mapValues { entry -> entry.value.count { it.startsWith(todayPrefix) } }
+    private fun setPaused(value: Boolean) {
+        if (value == paused) return
+        paused = value
+        EventLogger.log(
+            EventLogger.Kind.VPN, EventLogger.Level.INFO,
+            if (value) "enforcement PAUSED (unlock window)" else "enforcement resumed",
+        )
+        refreshNotification()
     }
 
-    private fun recordQuotaActivity(domain: String) {
-        val now = LocalDateTime.now()
-        val minuteBucket = now.format(minuteFmt)
-        rules.filter { it.enabled && it.type == RuleType.QUOTA && RuleEngine.matchesDomain(it.pattern, domain) }
-            .forEach { rule ->
-                quotaMinutes.getOrPut(rule.id) { ConcurrentHashMap.newKeySet() }.add(minuteBucket)
-            }
-    }
-
-    private fun startUsageFlusher() {
-        scope.launch {
-            while (true) {
-                delay(60_000)
-                flushUsage()
-            }
-        }
-    }
-
-    private suspend fun flushUsage() {
-        val today = LocalDate.now().toString()
-        // Drop minute-buckets from previous days so memory and counts stay date-scoped.
-        quotaMinutes.values.forEach { set -> set.removeIf { !it.startsWith(today) } }
-        quotaMinutes.forEach { (ruleId, minutes) ->
-            runCatching {
-                repo.saveUsage(
-                    UsageLedger(
-                        key = "dom:$ruleId",
-                        date = today,
-                        minutesUsed = minutes.count { it.startsWith(today) },
-                    ),
-                )
-            }
-        }
-        runCatching { repo.pruneUsage(LocalDate.now().minusDays(7).toString()) }
-        runCatching { repo.pruneBlocks(System.currentTimeMillis() - 14L * 24 * 3600 * 1000) }
-    }
 
     private fun logBlock(target: String, reason: String) {
         val now = System.currentTimeMillis()
@@ -288,6 +361,10 @@ class AdachiVpnService : VpnService() {
             .split(',').filter { it.isNotBlank() }.map { it.toLong() }
             .filter { now - it < CRASH_WINDOW_MS } + now)
         prefs.edit().putString(KEY_CRASHES, crashes.joinToString(",")).apply()
+    }
+
+    private fun clearCrashes() {
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove(KEY_CRASHES).apply()
     }
 
     // ---------------- Notification & lifecycle ----------------
@@ -324,6 +401,7 @@ class AdachiVpnService : VpnService() {
 
     override fun onRevoke() {
         Log.w(TAG, "VPN revoked")
+        EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.INFO, "VPN revoked by system/user")
         running = false
         SystemStatus.setVpnRunning(this, false)
         stopSelf()
@@ -331,8 +409,13 @@ class AdachiVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        EventLogger.log(EventLogger.Kind.VPN, EventLogger.Level.INFO, "VPN stopped")
         running = false
-        scope.launch { flushUsage() }
+        networkCallback?.let {
+            runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
+        }
+        networkCallback = null
+        currentNetwork = null
         runCatching { forwarder?.close() }
         runCatching { tun?.close() }
         SystemStatus.setVpnRunning(this, false)

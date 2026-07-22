@@ -2,91 +2,54 @@ package com.adachi.lockdown.data
 
 import android.content.Context
 import com.adachi.lockdown.rules.EditPolicy
+import com.adachi.lockdown.rules.RuleEngine
+import com.adachi.lockdown.unlock.UnlockManager
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import java.time.*
 
-/** Thrown when a change would loosen enforcement outside an unlock window. */
-class RelaxationLockedException :
-    Exception("This change loosens a restriction. It requires an active emergency unlock window.")
+class RelaxationLockedException : Exception("This change loosens a restriction. It requires an active emergency unlock window.")
+class CheckInRejectedException(message: String) : Exception(message)
 
-/**
- * Single entry point for rule/unlock/usage data. Enforces the
- * "stricter anytime, relaxing only while unlocked" policy at the data layer,
- * so UI mistakes can't bypass it.
- */
 class RulesRepository private constructor(private val db: AdachiDb) {
-
-    // ---- Observation ----
-
-    fun domainRules(): Flow<List<DomainRule>> = db.domainRules().observeAll()
-    fun appRules(): Flow<List<AppRule>> = db.appRules().observeAll()
+    fun rules(): Flow<List<RuleWithTargets>> = combine(db.rules().observeAll(), db.checkIns().observeAll()) { rules, _ -> loadWithTargets(rules) }
+    fun checkIns(): Flow<List<RuleCheckIn>> = db.checkIns().observeAll()
     fun unlockState(): Flow<UnlockState?> = db.unlockState().observe()
-    fun recentBlocks(limit: Int = 100): Flow<List<BlockLog>> = db.blockLog().observeRecent(limit)
-
-    suspend fun unlockStateNow(): UnlockState = db.unlockState().get() ?: UnlockState()
+    fun recentBlocks(limit: Int=100): Flow<List<BlockLog>> = db.blockLog().observeRecent(limit)
+    suspend fun rulesNow(): List<RuleWithTargets> = loadWithTargets(db.rules().enabled())
+    private suspend fun loadWithTargets(rules: List<Rule>) = rules.map { RuleWithTargets(it, db.targets().apps(it.id), db.targets().domains(it.id)) }
+    suspend fun unlockStateNow() = db.unlockState().get() ?: UnlockState()
     suspend fun saveUnlockState(state: UnlockState) = db.unlockState().upsert(state)
-
-    suspend fun enabledDomainRules(): List<DomainRule> = db.domainRules().getEnabled()
-    suspend fun enabledAppRules(): List<AppRule> = db.appRules().getEnabled()
-
-    suspend fun usageFor(date: String): List<UsageLedger> = db.usageLedger().getForDate(date)
-    suspend fun saveUsage(entry: UsageLedger) = db.usageLedger().upsert(entry)
-    suspend fun pruneUsage(beforeDate: String) = db.usageLedger().pruneBefore(beforeDate)
-
     suspend fun logBlock(entry: BlockLog) = db.blockLog().insert(entry)
-    suspend fun blocksSince(epochMs: Long): Int = db.blockLog().countSince(epochMs)
+    suspend fun blocksSince(epochMs: Long) = db.blockLog().countSince(epochMs)
     suspend fun pruneBlocks(beforeMs: Long) = db.blockLog().pruneBefore(beforeMs)
+    fun recentEvents(limit: Int=300): Flow<List<EventLog>> = db.eventLog().observeRecent(limit)
+    suspend fun logEvents(events: List<EventLog>) = db.eventLog().insertAll(events)
+    suspend fun pruneEvents(beforeMs: Long) = db.eventLog().pruneBefore(beforeMs)
+    suspend fun clearEvents() = db.eventLog().clear()
 
-    // ---- Domain rule mutations (policy-gated) ----
+    suspend fun addRule(item: RuleWithTargets, unlockActive: Boolean): Long { validate(item); if (!unlockedNow() && EditPolicy.isRelaxing(null,item)) throw RelaxationLockedException(); val id=db.rules().insert(item.rule.copy(createdAt=System.currentTimeMillis())); saveTargets(id,item); return id }
+    suspend fun updateRule(old: RuleWithTargets, item: RuleWithTargets, unlockActive: Boolean) { validate(item); if (!unlockedNow() && EditPolicy.isRelaxing(old,item)) throw RelaxationLockedException(); db.rules().update(item.rule); db.targets().clearApps(item.rule.id); db.targets().clearDomains(item.rule.id); saveTargets(item.rule.id,item) }
+    suspend fun deleteRule(item: RuleWithTargets, unlockActive: Boolean) { if (!unlockedNow() && EditPolicy.isRelaxing(item,null)) throw RelaxationLockedException(); db.rules().delete(item.rule) }
+    /** The database is authoritative; UI state may be inactive while its Flow is unsubscribed. */
+    private suspend fun unlockedNow() = UnlockManager.isActive(db.unlockState().get(), System.currentTimeMillis())
+    private suspend fun saveTargets(id: Long, item: RuleWithTargets) { db.targets().insertApps(item.apps.map { it.copy(ruleId=id) }); db.targets().insertDomains(item.domains.map { it.copy(ruleId=id) }) }
+    private fun validate(item: RuleWithTargets) { require(item.apps.isNotEmpty() || item.domains.isNotEmpty()) { "A rule needs at least one app or domain." }; if (item.rule.mode==RuleMode.TIMED) require(item.rule.timedAllowanceMin in 1..1440); if (item.rule.mode==RuleMode.TIME_FRAMED) require(item.rule.daysMask != 0 && item.rule.startMin in 0..1439 && item.rule.endMin in 0..1439) }
 
-    suspend fun addDomainRule(rule: DomainRule, unlockActive: Boolean): Long {
-        requireEditAllowed(null, rule, unlockActive)
-        return db.domainRules().insert(rule.copy(createdAt = System.currentTimeMillis()))
+    /** Intentional daily-use action; it is never subject to the edit unlock gate. */
+    suspend fun checkIn(ruleId: Long, minutes: Int, now: ZonedDateTime = ZonedDateTime.now()): RuleCheckIn {
+        require(minutes in CHECK_IN_MINUTES) { "Choose one of the offered durations." }
+        val rule = db.rules().get(ruleId) ?: throw CheckInRejectedException("This rule no longer exists.")
+        if (!rule.enabled || rule.mode !in setOf(RuleMode.TIMED,RuleMode.TIME_FRAMED)) throw CheckInRejectedException("This rule is not available for check-in.")
+        if (rule.mode==RuleMode.TIME_FRAMED && !RuleEngine.inWindow(rule.daysMask,rule.startMin,rule.endMin,now.toLocalDateTime())) throw CheckInRejectedException("Outside this rule's time frame.")
+        val today=now.toLocalDate().toString(); val old=db.checkIns().get(ruleId); val reserved=if(old?.localDate==today) old.reservedMinutes else 0
+        if (rule.mode==RuleMode.TIMED && reserved+minutes>rule.timedAllowanceMin) throw CheckInRejectedException("That full duration does not fit in today's remaining allowance.")
+        val base=maxOf(now.toInstant().toEpochMilli(), old?.expiresAtMs ?: 0L)
+        var expiry=base + minutes*60_000L
+        if(rule.mode==RuleMode.TIME_FRAMED) expiry=minOf(expiry, scheduleBoundary(rule,now).toInstant().toEpochMilli())
+        val grant=RuleCheckIn(ruleId,today,if(rule.mode==RuleMode.TIMED) reserved+minutes else reserved,expiry)
+        db.checkIns().upsert(grant); return grant
     }
-
-    suspend fun updateDomainRule(old: DomainRule, new: DomainRule, unlockActive: Boolean) {
-        requireEditAllowed(old, new, unlockActive)
-        db.domainRules().update(new)
-    }
-
-    suspend fun deleteDomainRule(rule: DomainRule, unlockActive: Boolean) {
-        requireEditAllowed(rule, null, unlockActive)
-        db.domainRules().delete(rule)
-    }
-
-    // ---- App rule mutations (policy-gated) ----
-
-    suspend fun addAppRule(rule: AppRule, unlockActive: Boolean): Long {
-        requireEditAllowed(null, rule, unlockActive)
-        return db.appRules().insert(rule.copy(createdAt = System.currentTimeMillis()))
-    }
-
-    suspend fun updateAppRule(old: AppRule, new: AppRule, unlockActive: Boolean) {
-        requireEditAllowed(old, new, unlockActive)
-        db.appRules().update(new)
-    }
-
-    suspend fun deleteAppRule(rule: AppRule, unlockActive: Boolean) {
-        requireEditAllowed(rule, null, unlockActive)
-        db.appRules().delete(rule)
-    }
-
-    // ---- Gating ----
-
-    private fun requireEditAllowed(old: DomainRule?, new: DomainRule?, unlockActive: Boolean) {
-        if (!unlockActive && EditPolicy.isRelaxing(old, new)) throw RelaxationLockedException()
-    }
-
-    private fun requireEditAllowed(old: AppRule?, new: AppRule?, unlockActive: Boolean) {
-        if (!unlockActive && EditPolicy.isRelaxing(old, new)) throw RelaxationLockedException()
-    }
-
-    companion object {
-        @Volatile
-        private var instance: RulesRepository? = null
-
-        fun get(context: Context): RulesRepository =
-            instance ?: synchronized(this) {
-                instance ?: RulesRepository(AdachiDb.get(context)).also { instance = it }
-            }
-    }
+    private fun scheduleBoundary(rule: Rule, now: ZonedDateTime): ZonedDateTime { var p=now; repeat(2881) { if (!RuleEngine.inWindow(rule.daysMask,rule.startMin,rule.endMin,p.toLocalDateTime())) return p; p=p.plusMinutes(1) }; return now }
+    companion object { val CHECK_IN_MINUTES=setOf(1,5,10,20,30,45,60); @Volatile private var instance: RulesRepository?=null; fun get(context: Context)=instance ?: synchronized(this) { instance ?: RulesRepository(AdachiDb.get(context)).also { instance=it } } }
 }

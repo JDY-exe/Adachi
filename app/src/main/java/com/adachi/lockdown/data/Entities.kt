@@ -1,81 +1,52 @@
 package com.adachi.lockdown.data
 
 import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
-enum class RuleType { BLOCK, ALLOW, WINDOW, QUOTA }
-
+enum class RuleMode { BLOCK, ALLOW, TIMED, TIME_FRAMED }
 const val ALL_DAYS_MASK = 0b1111111 // bit0=Mon .. bit6=Sun
 
-@Entity(tableName = "domain_rules")
-data class DomainRule(
+@Entity(tableName = "rules")
+data class Rule(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    /** e.g. "reddit.com", "*.reddit.com", or "*" for everything */
-    val pattern: String,
-    val type: RuleType,
-    val daysMask: Int = ALL_DAYS_MASK,
-    /** Minutes from midnight, window start (WINDOW rules). */
-    val startMin: Int = 0,
-    /** Minutes from midnight, window end (WINDOW rules). May be < startMin (wraps midnight). */
-    val endMin: Int = 0,
-    /** Daily allowance in minutes (QUOTA rules). */
-    val quotaMin: Int = 0,
+    val name: String,
+    val mode: RuleMode,
     val enabled: Boolean = true,
-    val createdAt: Long = 0,
-)
-
-@Entity(tableName = "app_rules")
-data class AppRule(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    /** Android package name, e.g. "com.reddit.frontpage", or "*" for every app. */
-    val packageName: String,
-    val label: String = "",
-    val type: RuleType,
+    /** Daily check-in budget for TIMED rules. */ val timedAllowanceMin: Int = 0,
     val daysMask: Int = ALL_DAYS_MASK,
     val startMin: Int = 0,
     val endMin: Int = 0,
-    val quotaMin: Int = 0,
-    val enabled: Boolean = true,
     val createdAt: Long = 0,
 )
 
-/**
- * Singleton row (id = 1): emergency-unlock bookkeeping and clock-tamper watermark.
- */
+@Entity(tableName = "rule_app_targets", primaryKeys = ["ruleId", "packageName"], foreignKeys = [ForeignKey(entity = Rule::class, parentColumns = ["id"], childColumns = ["ruleId"], onDelete = ForeignKey.CASCADE)], indices = [Index("ruleId")])
+data class RuleAppTarget(val ruleId: Long, val packageName: String, val label: String = "")
+
+@Entity(tableName = "rule_domain_targets", primaryKeys = ["ruleId", "pattern"], foreignKeys = [ForeignKey(entity = Rule::class, parentColumns = ["id"], childColumns = ["ruleId"], onDelete = ForeignKey.CASCADE)], indices = [Index("ruleId")])
+data class RuleDomainTarget(val ruleId: Long, val pattern: String)
+
+/** One durable, extendable check-in per rule. Reserved minutes reset by local date. */
+@Entity(tableName = "rule_check_ins", foreignKeys = [ForeignKey(entity = Rule::class, parentColumns = ["id"], childColumns = ["ruleId"], onDelete = ForeignKey.CASCADE)], indices = [Index("ruleId")])
+data class RuleCheckIn(
+    @PrimaryKey val ruleId: Long,
+    val localDate: String,
+    val reservedMinutes: Int,
+    val expiresAtMs: Long,
+)
+
+data class RuleWithTargets(
+    val rule: Rule,
+    val apps: List<RuleAppTarget>,
+    val domains: List<RuleDomainTarget>,
+)
+
 @Entity(tableName = "unlock_state")
-data class UnlockState(
-    @PrimaryKey val id: Int = 1,
-    /** CSV of consumed ISO weeks, e.g. "2026-W29,2026-W30". Append-only. */
-    val consumedWeeks: String = "",
-    /** Epoch ms until which the 30-min unlock window is active. 0 = inactive. */
-    val activeUntilMs: Long = 0,
-    /** Local date (yyyy-MM-dd) of the last malfunction pause; one per day. */
-    val malfunctionPauseDate: String = "",
-    /** Epoch ms when device-owner provisioning happened (48h grace). 0 = not provisioned. */
-    val provisionedAtMs: Long = 0,
-    /** Clock-tamper watermark: highest UTC epoch ms ever observed. */
-    val utcWatermarkMs: Long = 0,
-    /** elapsedRealtime at the moment the watermark was recorded. */
-    val watermarkElapsedMs: Long = 0,
-)
-
-/**
- * Per-day usage accounting. key = "dom:<ruleId>" or "app:<packageName>".
- */
-@Entity(tableName = "usage_ledger", primaryKeys = ["key", "date"])
-data class UsageLedger(
-    val key: String,
-    /** Local date yyyy-MM-dd. */
-    val date: String,
-    val minutesUsed: Int = 0,
-)
+data class UnlockState(@PrimaryKey val id: Int = 1, val consumedWeeks: String = "", val activeUntilMs: Long = 0, val malfunctionPauseDate: String = "", val provisionedAtMs: Long = 0, val utcWatermarkMs: Long = 0, val watermarkElapsedMs: Long = 0)
 
 @Entity(tableName = "block_log")
-data class BlockLog(
-    @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val epochMs: Long,
-    /** "DOMAIN" or "APP" */
-    val kind: String,
-    val target: String,
-    val reason: String,
-)
+data class BlockLog(@PrimaryKey(autoGenerate = true) val id: Long = 0, val epochMs: Long, val kind: String, val target: String, val reason: String)
+
+@Entity(tableName = "event_log")
+data class EventLog(@PrimaryKey(autoGenerate = true) val id: Long = 0, val epochMs: Long, val kind: String, val level: String, val message: String)

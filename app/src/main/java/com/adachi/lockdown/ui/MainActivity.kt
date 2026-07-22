@@ -6,8 +6,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -30,9 +30,10 @@ import androidx.navigation.compose.rememberNavController
 import com.adachi.lockdown.ui.theme.AdachiTheme
 
 object Routes {
-    const val DASHBOARD = "dashboard"
-    const val DOMAINS = "domains"
-    const val APPS = "apps"
+    const val CHECK_INS = "checkins"
+    const val RULES = "rules"
+    const val STATUS = "status"
+    const val LOGS = "logs"
     const val UNLOCK = "unlock"
     const val SETUP = "setup"
 }
@@ -81,14 +82,10 @@ fun AdachiNavHost(pendingRoute: androidx.compose.runtime.MutableState<String?> =
     }
 
     val items: List<Triple<String, String, @Composable () -> Unit>> = listOf(
-        Triple(Routes.DASHBOARD, "Home") { Icon(Icons.Default.Home, contentDescription = "Home") },
-        Triple(Routes.DOMAINS, "Domains") {
-            Icon(androidx.compose.ui.res.painterResource(com.adachi.lockdown.R.drawable.ic_globe), contentDescription = "Domains")
-        },
-        Triple(Routes.APPS, "Apps") {
-            Icon(androidx.compose.ui.res.painterResource(com.adachi.lockdown.R.drawable.ic_grid), contentDescription = "Apps")
-        },
-        Triple(Routes.UNLOCK, "Unlock") { Icon(Icons.Default.Lock, contentDescription = "Unlock") },
+        Triple(Routes.CHECK_INS, "Check-ins") { Icon(Icons.Default.Home, contentDescription = "Check-ins") },
+        Triple(Routes.RULES, "Rules") { Icon(androidx.compose.ui.res.painterResource(com.adachi.lockdown.R.drawable.ic_grid), contentDescription = "Rules") },
+        Triple(Routes.STATUS, "Status") { Icon(androidx.compose.ui.res.painterResource(com.adachi.lockdown.R.drawable.ic_globe), contentDescription = "Status") },
+        Triple(Routes.LOGS, "Logs") { Icon(Icons.AutoMirrored.Filled.List, contentDescription = "Logs") },
     )
 
     Scaffold(
@@ -117,17 +114,13 @@ fun AdachiNavHost(pendingRoute: androidx.compose.runtime.MutableState<String?> =
     ) { padding ->
         NavHost(
             navController = nav,
-            startDestination = Routes.DASHBOARD,
+            startDestination = Routes.CHECK_INS,
             modifier = Modifier.padding(padding),
         ) {
-            composable(Routes.DASHBOARD) {
-                DashboardScreen(
-                    onOpenUnlock = { nav.navigate(Routes.UNLOCK) },
-                    onOpenSetup = { nav.navigate(Routes.SETUP) },
-                )
-            }
-            composable(Routes.DOMAINS) { DomainRulesScreen(rulesVm, snackbar) }
-            composable(Routes.APPS) { AppRulesScreen(rulesVm, snackbar) }
+            composable(Routes.CHECK_INS) { CheckInsScreen(rulesVm, snackbar) }
+            composable(Routes.RULES) { RulesScreen(rulesVm, snackbar) }
+            composable(Routes.STATUS) { DashboardScreen(onOpenUnlock = { nav.navigate(Routes.UNLOCK) }, onOpenSetup = { nav.navigate(Routes.SETUP) }) }
+            composable(Routes.LOGS) { LogScreen() }
             composable(Routes.UNLOCK) { UnlockScreen() }
             composable(Routes.SETUP) { SetupScreen() }
         }

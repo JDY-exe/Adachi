@@ -6,6 +6,9 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.UserManager
 import android.provider.Settings
+import android.net.VpnService
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -34,6 +37,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.adachi.lockdown.BuildConfig
 import com.adachi.lockdown.admin.DeviceOwnerManager
 import com.adachi.lockdown.status.SystemStatus
+import com.adachi.lockdown.vpn.AdachiVpnService
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -44,6 +48,9 @@ fun SetupScreen(vm: RulesViewModel = viewModel()) {
     var refreshTick by remember { mutableStateOf(0) }
     var applying by remember { mutableStateOf(false) }
     var applyError by remember { mutableStateOf<String?>(null) }
+    val vpnPermission = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) AdachiVpnService.start(context)
+    }
 
     // Refresh the checks every couple of seconds (e.g. right after granting).
     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -77,6 +84,14 @@ fun SetupScreen(vm: RulesViewModel = viewModel()) {
                 )
                 CheckRow("Domain filter (VPN) running", vpnOn)
                 CheckRow("App blocker (accessibility)", accessibilityOn)
+                if (!vpnOn) {
+                    Button(onClick = {
+                        VpnService.prepare(context)?.let { vpnPermission.launch(it) }
+                            ?: AdachiVpnService.start(context)
+                    }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Set up and start domain-filter VPN")
+                    }
+                }
                 if (!accessibilityOn) {
                     Button(onClick = {
                         context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))

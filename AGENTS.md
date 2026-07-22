@@ -23,6 +23,17 @@ Enforcement layers:
   to 1.1.1.1 over UDP via a protected socket. Domain quotas = minutes with DNS
   activity (approximate by design). Crash-loop (3/5min) => fail open, never
   brick connectivity. `vpn/DnsCodec`, `vpn/IpPacket` — pure, unit-tested.
+  `vpn/DnsForwarder` reports upstream health (timeouts, socket errors) —
+  a dead upstream after a network switch looks exactly like "everything is
+  blocked", so never remove that signal. The service rebuilds the forwarder
+  socket on network switch (ConnectivityManager default-network callback), on
+  10 consecutive timeouts, and on 3 consecutive send errors (30s rebuild
+  throttle) — the protected socket is bound to its creation network and dies
+  silently otherwise. Send errors never become timeouts (the query is dropped
+  instantly), so both signals are needed. Sockets are
+  created on Dispatchers.IO only: debug builds run StrictMode
+  death-on-network, so main-thread socket creation kills establish() with
+  NetworkOnMainThreadException. Crash counter clears on successful establish.
 - `apps/AppBlockerService` — AccessibilityService: on foreground-app change and
   a 30s ticker, blocks apps via full-screen overlay + GLOBAL_ACTION_HOME.
   App quotas = foreground minutes, date-scoped in memory. Never blocks Adachi
@@ -42,9 +53,11 @@ Enforcement layers:
   edits as relaxing (needs active unlock) vs restricting (always allowed);
   enforced in `data/RulesRepository`, which throws `RelaxationLockedException`.
 - `data/` — Room: DomainRule, AppRule, UnlockState (singleton), UsageLedger,
-  BlockLog.
+  BlockLog, EventLog. `data/EventLogger` — verbose diagnostic feed: batched
+  (1.5s) Room writes + logcat mirror, per-key throttling for chatty
+  categories (allowed DNS 1/min/domain, blocks 1/5s/domain).
 - `ui/` — Compose single-activity nav: Dashboard, Domain rules, App rules,
-  Unlock, Setup.
+  Logs (live EventLog feed), Unlock, Setup.
 
 Key behaviors:
 - "Stricter anytime": adding/tightening blocks never needs the unlock.

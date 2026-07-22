@@ -15,11 +15,11 @@ import android.view.accessibility.AccessibilityEvent
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import com.adachi.lockdown.data.AppRule
 import com.adachi.lockdown.data.BlockLog
-import com.adachi.lockdown.data.RuleType
+import com.adachi.lockdown.data.EventLogger
+import com.adachi.lockdown.data.RuleWithTargets
+import com.adachi.lockdown.data.RuleCheckIn
 import com.adachi.lockdown.data.RulesRepository
-import com.adachi.lockdown.data.UsageLedger
 import com.adachi.lockdown.rules.RuleEngine
 import com.adachi.lockdown.unlock.UnlockManager
 import kotlinx.coroutines.CoroutineScope
@@ -29,7 +29,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
-import java.time.LocalDate
 import java.time.LocalDateTime
 import java.util.concurrent.ConcurrentHashMap
 
@@ -53,16 +52,12 @@ class AppBlockerService : AccessibilityService() {
     private lateinit var repo: RulesRepository
     private lateinit var wm: WindowManager
 
-    @Volatile private var rules: List<AppRule> = emptyList()
+    @Volatile private var rules: List<RuleWithTargets> = emptyList()
+    @Volatile private var checkIns: Map<Long, RuleCheckIn> = emptyMap()
     @Volatile private var paused = false
     @Volatile private var currentForeground: String? = null
     @Volatile private var overlay: View? = null
 
-    /** packageName -> seconds used today (in-memory; flushed to Room). */
-    private val usageSeconds = ConcurrentHashMap<String, Int>()
-
-    @Volatile private var usageDate: String = LocalDate.now().toString()
-    private var foregroundSinceMs: Long = 0
 
     private val neverBlock = mutableSetOf<String>()
 
@@ -74,6 +69,7 @@ class AppBlockerService : AccessibilityService() {
         observeState()
         startTicker()
         Log.i(TAG, "App blocker connected")
+        EventLogger.log(EventLogger.Kind.APP, EventLogger.Level.INFO, "app blocker connected")
     }
 
     private fun computeNeverBlock() {
@@ -94,59 +90,22 @@ class AppBlockerService : AccessibilityService() {
     }
 
     private fun onForegroundChanged(pkg: String) {
-        closeSession()
         currentForeground = pkg
-        foregroundSinceMs = System.currentTimeMillis()
         evaluate(pkg)
     }
-
-    /** Accumulate the elapsed foreground time for the previous app. */
-    private fun closeSession() {
-        resetUsageIfNewDay()
-        val pkg = currentForeground ?: return
-        if (foregroundSinceMs <= 0) return
-        val elapsedSec = ((System.currentTimeMillis() - foregroundSinceMs) / 1000).toInt()
-        if (elapsedSec > 0 && matchesQuotaRule(pkg)) {
-            usageSeconds.merge(pkg, elapsedSec, Int::plus)
-        }
-    }
-
-    /** In-memory counters are date-scoped: clear them when the day rolls over. */
-    private fun resetUsageIfNewDay() {
-        val today = LocalDate.now().toString()
-        if (today != usageDate) {
-            usageSeconds.clear()
-            usageDate = today
-        }
-    }
-
-    private fun matchesQuotaRule(pkg: String): Boolean =
-        rules.any { it.enabled && it.type == RuleType.QUOTA && RuleEngine.matchesApp(it.packageName, pkg) }
 
     private fun evaluate(pkg: String) {
         if (paused || pkg in neverBlock) {
             hideOverlay()
             return
         }
-        val verdict = RuleEngine.evaluateApp(pkg, rules, LocalDateTime.now(), usageMinutesToday())
+        val verdict = RuleEngine.evaluateApp(pkg, rules, checkIns, LocalDateTime.now(), System.currentTimeMillis())
         when (verdict) {
             is RuleEngine.Verdict.Block -> blockApp(pkg, verdict)
             RuleEngine.Verdict.Allow -> hideOverlay()
         }
     }
 
-    private fun usageMinutesToday(): Map<Long, Int> {
-        resetUsageIfNewDay()
-        val result = mutableMapOf<Long, Int>()
-        for (rule in rules) {
-            if (!rule.enabled || rule.type != RuleType.QUOTA) continue
-            // Aggregate minutes across all packages matched by this rule.
-            val seconds = usageSeconds.filterKeys { RuleEngine.matchesApp(rule.packageName, it) }
-                .values.sum()
-            result[rule.id] = seconds / 60
-        }
-        return result
-    }
 
     private fun blockApp(pkg: String, verdict: RuleEngine.Verdict.Block) {
         val label = runCatching {
@@ -154,11 +113,16 @@ class AppBlockerService : AccessibilityService() {
         }.getOrDefault(pkg)
         val reason = when (verdict.reason) {
             RuleEngine.Reason.BLOCKED -> "This app is blocked"
-            RuleEngine.Reason.OUTSIDE_WINDOW -> "Allowed only during its scheduled window"
-            RuleEngine.Reason.QUOTA_EXHAUSTED -> "Daily time limit reached"
+            RuleEngine.Reason.OUTSIDE_TIME_FRAME -> "Outside its scheduled time frame"
+            RuleEngine.Reason.CHECK_IN_REQUIRED -> "Check in to use this rule"
         }
         showOverlay(label, reason)
         performGlobalAction(GLOBAL_ACTION_HOME)
+        EventLogger.log(
+            EventLogger.Kind.APP, EventLogger.Level.BLOCK,
+            "$label ($pkg) blocked — ${verdict.reason}, rule #${verdict.ruleId}",
+            throttleKey = "appblk:$pkg", throttleMs = 30_000,
+        )
         scope.launch {
             runCatching {
                 repo.logBlock(
@@ -246,11 +210,13 @@ class AppBlockerService : AccessibilityService() {
     private fun observeState() {
         scope.launch {
             combine(
-                repo.appRules(),
+                repo.rules(),
+                repo.checkIns(),
                 repo.unlockState(),
-            ) { rules, unlock -> rules to unlock }
-                .collect { (rules, unlock) ->
-                    this@AppBlockerService.rules = rules.filter { it.enabled }
+            ) { rules, grants, unlock -> Triple(rules, grants, unlock) }
+                .collect { (rules, grants, unlock) ->
+                    this@AppBlockerService.rules = rules.filter { it.rule.enabled }
+                    this@AppBlockerService.checkIns = grants.associateBy { it.ruleId }
                     paused = UnlockManager.isActive(unlock, System.currentTimeMillis())
                     if (paused) hideOverlay()
                 }
@@ -263,28 +229,16 @@ class AppBlockerService : AccessibilityService() {
                 delay(30_000)
                 // Unlock state may expire by time alone.
                 paused = UnlockManager.isActive(repo.unlockStateNow(), System.currentTimeMillis())
-                closeSession()
-                foregroundSinceMs = System.currentTimeMillis()
                 currentForeground?.let { evaluate(it) }
-                flushUsage()
             }
         }
     }
 
-    private suspend fun flushUsage() {
-        val today = LocalDate.now().toString()
-        usageSeconds.forEach { (pkg, seconds) ->
-            runCatching {
-                repo.saveUsage(UsageLedger(key = "app:$pkg", date = today, minutesUsed = seconds / 60))
-            }
-        }
-    }
 
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         hideOverlay()
-        scope.launch { flushUsage() }
         scope.cancel()
         super.onDestroy()
     }
