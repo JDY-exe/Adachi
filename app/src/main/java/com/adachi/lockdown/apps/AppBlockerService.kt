@@ -20,6 +20,7 @@ import com.adachi.lockdown.data.EventLogger
 import com.adachi.lockdown.data.RuleWithTargets
 import com.adachi.lockdown.data.RuleCheckIn
 import com.adachi.lockdown.data.RulesRepository
+import com.adachi.lockdown.data.UnlockState
 import com.adachi.lockdown.rules.RuleEngine
 import com.adachi.lockdown.unlock.UnlockManager
 import kotlinx.coroutines.CoroutineScope
@@ -54,6 +55,7 @@ class AppBlockerService : AccessibilityService() {
 
     @Volatile private var rules: List<RuleWithTargets> = emptyList()
     @Volatile private var checkIns: Map<Long, RuleCheckIn> = emptyMap()
+    @Volatile private var unlockState: UnlockState? = null
     @Volatile private var paused = false
     @Volatile private var currentForeground: String? = null
     @Volatile private var overlay: View? = null
@@ -217,6 +219,7 @@ class AppBlockerService : AccessibilityService() {
                 .collect { (rules, grants, unlock) ->
                     this@AppBlockerService.rules = rules.filter { it.rule.enabled }
                     this@AppBlockerService.checkIns = grants.associateBy { it.ruleId }
+                    this@AppBlockerService.unlockState = unlock
                     paused = UnlockManager.isActive(unlock, System.currentTimeMillis())
                     if (paused) hideOverlay()
                 }
@@ -227,8 +230,9 @@ class AppBlockerService : AccessibilityService() {
         scope.launch {
             while (true) {
                 delay(30_000)
-                // Unlock state may expire by time alone.
-                paused = UnlockManager.isActive(repo.unlockStateNow(), System.currentTimeMillis())
+                // Unlock state may expire by time alone; the cached state is
+                // enough (flow emissions keep it current) — no DB read here.
+                paused = UnlockManager.isActive(unlockState, System.currentTimeMillis())
                 currentForeground?.let { evaluate(it) }
             }
         }

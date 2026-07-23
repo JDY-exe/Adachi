@@ -21,6 +21,7 @@ Single offline app. No server, no accounts, no data leaves your phone.
 - [Turning it off (teardown)](#turning-it-off-teardown)
 - [Known limitations](#known-limitations)
 - [Troubleshooting](#troubleshooting)
+- [Changelog](#changelog)
 
 ---
 
@@ -291,3 +292,37 @@ app's Setup screen, exact for your install.
 
 **I truly want out.** Unlock tab → Deactivate (grace period or unlock window),
 or factory reset. See [Teardown](#turning-it-off-teardown).
+
+## Changelog
+
+### 0.2.0 — Battery & efficiency
+
+A whole-app audit after reports of high battery drain. Adachi now costs
+essentially nothing while idle; enforcement behavior is unchanged.
+
+- **Clock watchdog no longer writes to the database every minute.** The
+  clock-tamper watermark is kept exactly in memory and persisted every
+  15 minutes (or immediately on tamper) instead of every 60 seconds —
+  eliminating ~1,400 database writes per day and the per-minute fan-out that
+  woke every background component to process them.
+- **No more database polling for the unlock window.** The VPN service and the
+  app blocker now detect unlock-window expiry from cached state (pushed by the
+  database when it actually changes) instead of re-querying every 15/30
+  seconds — removing ~8,600 database reads per day.
+- **Diagnostic log flushes on demand.** The Logs-tab event feed previously
+  woke up every 1.5 seconds around the clock (~57,000 timer wakeups/day); it
+  now only batches writes while events are actually pending and sleeps
+  completely when idle.
+- **Fewer accessibility events.** The app blocker no longer subscribes to
+  window-change events it never uses — less noise through the accessibility
+  pipeline.
+- **Robustness:** the VPN reader thread can no longer spin at 100% CPU on a
+  misbehaving tunnel; the Unlock screen only polls device-owner status while
+  it's on screen.
+
+### 0.1.0 — Initial release
+
+- DNS-only local VPN domain filter (NXDOMAIN blocks, Cloudflare upstream),
+  accessibility-based app blocker, device-owner anti-tamper, four rule types
+  (Block / Allow / Window / Quota), once-per-week emergency unlock, daily
+  malfunction pause, travel mode, clock-tamper detection, live diagnostic log.

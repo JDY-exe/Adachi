@@ -9,13 +9,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Verbose diagnostic logging feeding the in-app log screen.
  *
  * Thread-safe and non-suspending: callers (VPN packet thread, accessibility
- * callbacks) just enqueue. A flusher batches rows into Room every ~1.5s so
- * chatty DNS traffic doesn't thrash the DB, and Room's observable query makes
+ * callbacks) just enqueue. Flushes are scheduled on demand (~1.5s after the
+ * first queued event, coalesced) so chatty DNS traffic doesn't thrash the DB
+ * and an idle device has zero timer wakeups. Room's observable query makes
  * the UI feed live. Everything is mirrored to logcat (tag "Adachi").
  *
  * Callers throttle high-frequency categories via [throttleKey]/[throttleMs]
@@ -36,6 +38,7 @@ object EventLogger {
 
     private val queue = ConcurrentLinkedQueue<EventLog>()
     private val throttledAt = ConcurrentHashMap<String, Long>()
+    private val flushScheduled = AtomicBoolean(false)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun init(context: Context) {
@@ -44,10 +47,6 @@ object EventLogger {
         repo = r
         scope.launch {
             runCatching { r.pruneEvents(System.currentTimeMillis() - RETENTION_MS) }
-            while (true) {
-                delay(FLUSH_INTERVAL_MS)
-                flush()
-            }
         }
     }
 
@@ -78,7 +77,21 @@ object EventLogger {
                 message = message,
             ),
         )
-        if (queue.size >= FLUSH_THRESHOLD) scope.launch { flush() }
+        if (queue.size >= FLUSH_THRESHOLD) scope.launch { flush() } else scheduleFlush()
+    }
+
+    /** Coalesced delayed flush; runs only while events are pending. */
+    private fun scheduleFlush() {
+        if (flushScheduled.compareAndSet(false, true)) {
+            scope.launch {
+                delay(FLUSH_INTERVAL_MS)
+                flushScheduled.set(false)
+                flush()
+                // An event may have slipped in between draining and the flag
+                // reset above; keep draining while anything is pending.
+                if (queue.isNotEmpty()) scheduleFlush()
+            }
+        }
     }
 
     private suspend fun flush() {

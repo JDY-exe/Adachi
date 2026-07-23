@@ -61,6 +61,7 @@ class AdachiVpnService : VpnService() {
 
     @Volatile private var rules: List<RuleWithTargets> = emptyList()
     @Volatile private var checkIns: Map<Long, RuleCheckIn> = emptyMap()
+    @Volatile private var unlockState: UnlockState? = null
 
     /** target -> last log epoch ms, to throttle block logging. */
     private val recentLogs = ConcurrentHashMap<String, Long>()
@@ -206,7 +207,13 @@ class AdachiVpnService : VpnService() {
             try {
                 while (running) {
                     val n = input.read(buf)
-                    if (n <= 0) continue
+                    if (n <= 0) {
+                        // read() on a tun fd normally blocks; a non-positive
+                        // return on a live fd would spin this thread at 100%
+                        // CPU, so back off instead of continuing hot.
+                        Thread.sleep(10)
+                        continue
+                    }
                     handlePacket(buf.copyOf(n))
                 }
             } catch (e: Exception) {
@@ -309,15 +316,16 @@ class AdachiVpnService : VpnService() {
                     }
                     this@AdachiVpnService.rules = enabled
                     this@AdachiVpnService.checkIns = grants.associateBy { it.ruleId }
+                    this@AdachiVpnService.unlockState = unlock
                     setPaused(UnlockManager.isActive(unlock, System.currentTimeMillis()))
                 }
         }
-        // The unlock window expires by time alone; check periodically.
+        // The unlock window expires by time alone; re-check the cached state
+        // periodically. Pure in-memory comparison — no DB read.
         scope.launch {
             while (true) {
                 delay(15_000)
-                val s = repo.unlockStateNow()
-                setPaused(UnlockManager.isActive(s, System.currentTimeMillis()))
+                setPaused(UnlockManager.isActive(unlockState, System.currentTimeMillis()))
             }
         }
     }

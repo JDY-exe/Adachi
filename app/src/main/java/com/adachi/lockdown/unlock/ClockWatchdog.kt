@@ -8,6 +8,7 @@ import androidx.core.app.NotificationCompat
 import com.adachi.lockdown.AdachiApp
 import com.adachi.lockdown.R
 import com.adachi.lockdown.data.RulesRepository
+import com.adachi.lockdown.data.UnlockState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -27,10 +28,32 @@ object ClockWatchdog {
 
     private const val TAG = "ClockWatchdog"
     private const val CHECK_INTERVAL_MS = 60_000L
+    /**
+     * How often the advancing watermark is persisted. Writing on every 60s
+     * check would thrash Room (and re-emit unlockState() to every collector)
+     * once a minute; checks run against the exact in-memory watermark, so
+     * persisting every 15 min loses nothing except after a process restart
+     * (bounded, like CLOCK_TOLERANCE_MS). Tamper results always persist.
+     */
+    private const val PERSIST_INTERVAL_MS = UnlockManager.CLOCK_TOLERANCE_MS
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile
     private var started = false
+
+    /**
+     * Exact, up-to-the-minute watermark (the DB copy lags by up to
+     * PERSIST_INTERVAL_MS). The watchdog owns ONLY these two fields; when
+     * persisting, they are merged onto a freshly read row so concurrent
+     * writers (unlock spends, provisioning) are never clobbered.
+     * wmUtcMs < 0 means "not seeded from the DB yet".
+     */
+    @Volatile
+    private var wmUtcMs = -1L
+    @Volatile
+    private var wmElapsedMs = 0L
+    @Volatile
+    private var lastPersistedWatermarkMs = 0L
 
     fun start(context: Context) {
         if (started) return
@@ -62,19 +85,36 @@ object ClockWatchdog {
                 SystemClock.elapsedRealtime(),
             )
             repo.saveUnlockState(result.state)
+            wmUtcMs = result.state.utcWatermarkMs
+            wmElapsedMs = result.state.watermarkElapsedMs
+            lastPersistedWatermarkMs = result.state.utcWatermarkMs
             if (result.tampered) onTamper(appContext, repo)
         }
     }
 
     private suspend fun check(context: Context) {
         val repo = RulesRepository.get(context)
-        val state = repo.unlockStateNow()
+        if (wmUtcMs < 0) {
+            val seeded = repo.unlockStateNow()
+            wmUtcMs = seeded.utcWatermarkMs
+            wmElapsedMs = seeded.watermarkElapsedMs
+            lastPersistedWatermarkMs = seeded.utcWatermarkMs
+        }
+        val firstInit = wmUtcMs <= 0L
         val result = UnlockManager.updateWatermark(
-            state,
+            UnlockState(utcWatermarkMs = wmUtcMs, watermarkElapsedMs = wmElapsedMs),
             System.currentTimeMillis(),
             SystemClock.elapsedRealtime(),
         )
-        repo.saveUnlockState(result.state)
+        wmUtcMs = result.state.utcWatermarkMs
+        wmElapsedMs = result.state.watermarkElapsedMs
+        if (result.tampered || firstInit || wmUtcMs - lastPersistedWatermarkMs >= PERSIST_INTERVAL_MS) {
+            // Merge the watermark onto the current row: other fields may have
+            // been written by unlock spends etc. since our last DB read.
+            val fresh = repo.unlockStateNow()
+            repo.saveUnlockState(fresh.copy(utcWatermarkMs = wmUtcMs, watermarkElapsedMs = wmElapsedMs))
+            lastPersistedWatermarkMs = wmUtcMs
+        }
         if (result.tampered) onTamper(context, repo)
     }
 
@@ -88,6 +128,9 @@ object ClockWatchdog {
             SystemClock.elapsedRealtime(),
         ).state
         repo.saveUnlockState(reanchored)
+        wmUtcMs = reanchored.utcWatermarkMs
+        wmElapsedMs = reanchored.watermarkElapsedMs
+        lastPersistedWatermarkMs = reanchored.utcWatermarkMs
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.notify(
             AdachiApp.NOTIF_ID_FAILSAFE,

@@ -53,8 +53,9 @@ Enforcement layers:
   edits as relaxing (needs active unlock) vs restricting (always allowed);
   enforced in `data/RulesRepository`, which throws `RelaxationLockedException`.
 - `data/` — Room: DomainRule, AppRule, UnlockState (singleton), UsageLedger,
-  BlockLog, EventLog. `data/EventLogger` — verbose diagnostic feed: batched
-  (1.5s) Room writes + logcat mirror, per-key throttling for chatty
+  BlockLog, EventLog. `data/EventLogger` — verbose diagnostic feed: on-demand
+  batched Room writes (flush scheduled ~1.5s after the first queued event,
+  zero wakeups when idle) + logcat mirror, per-key throttling for chatty
   categories (allowed DNS 1/min/domain, blocks 1/5s/domain).
 - `ui/` — Compose single-activity nav: Dashboard, Domain rules, App rules,
   Logs (live EventLog feed), Unlock, Setup.
